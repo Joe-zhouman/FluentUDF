@@ -1,0 +1,307 @@
+#
+#  Copyright 1987-2022 ANSYS, Inc. All Rights Reserved.
+#
+import os
+import re
+import SCons
+
+env = Environment()
+vars = Variables('user.txt')
+vars.Add('VERSION','','')
+vars.Add('FLUENT_ARCH','','')
+vars.Add('FLUENT_RELEASE','','')
+vars.Add('HOST_FLAGS','','')
+vars.Add('CSOURCES','','')
+vars.Add('HSOURCES','','')
+#vars.Add('PARALLEL_NODE','','')
+
+env = Environment(variables=vars)
+
+if os.environ.get('FLUENT_INC','')=='':
+  print ("Fluent Directory not set")
+  exit()
+
+if env['FLUENT_ARCH'] != 'win64':
+  print ("FLUENT_ARCH variable should be win64")
+  exit()
+if env['VERSION'] not in ['2d_host','2d_node','3d_host','3d_node','2ddp_host','2ddp_node','3ddp_host','3ddp_node']:
+  print ("Fluent version not supported")
+  exit()
+  
+env['MSVC'] = os.environ['FLUENT_UDF_COMPILER']
+env['FLUENT_INC'] = os.environ['FLUENT_INC']
+fluent_inc_s = '"'+str(env['FLUENT_INC'])+'"'
+env['CLANGV'] = os.environ['FLUENT_UDF_CLANG']
+if env['CLANGV'] == 'clangenv':
+  env['CC'] = 'clang-cl'
+  env['CLINK'] = 'lld-link'
+  env['ENV']['PATH'] = os.environ['PATH']
+  #env['ENV']['LIB'] = os.environ['LIB']
+  #env['ENV']['LIBPATH'] = os.environ['LIBPATH']
+else :
+  env['CC'] = os.path.join(fluent_inc_s,'ntbin','clang','bin','clang-cl')
+  env['CLINK'] = os.path.join(fluent_inc_s,'ntbin','clang','bin','lld-link')
+
+print ("Compiler used is ", env['CC'])
+print ("Linker used is ",env['CLINK'])
+
+source_files = []
+if env['CSOURCES']:
+  source_files = env['CSOURCES'].split('$(SRC)')
+
+header_files = []
+if env['HSOURCES']:
+  header_files = env['HSOURCES'].split('$(SRC)')
+
+
+sfiles = []
+for c in source_files:
+  if c.rstrip().endswith('.c') or c.rstrip().endswith('.cpp'):
+    sfiles.append(c.rstrip())
+
+hfiles = []
+for c in header_files:
+  if c.rstrip().endswith('.h'):
+    hfiles.append(c.rstrip())
+
+fluent_path = env['FLUENT_INC']
+
+version = env['VERSION']
+fluent_inc = env['FLUENT_INC']
+arch = env['FLUENT_ARCH']
+release = env['FLUENT_RELEASE']
+
+release_strings = release.split('fluent')
+release_year = release_strings[1]
+release_ver_strings = release_strings[1].split('.')
+fstring = release_ver_strings[0]+release_ver_strings[1]+release_ver_strings[2]
+
+def generate_udf_source(target,source,env):
+
+ defines = []
+ for s in source:
+  f = open(str(s),'r')
+  with f:
+    multi_lines=[]
+    ncomm = 0
+    for line in f:
+       if "/*" in line:
+         ncomm+=1
+       if "*/" in line:
+         ncomm=0
+       if line.lstrip().startswith('DEFINE_') and ncomm==0:
+           if ")" in line:
+              csub = str(line).split('{')
+              multi_lines.append(csub[0].strip())
+              nlines = ""
+              for c in multi_lines:
+                nlines += c
+              defines.append(nlines)
+              multi_lines=[]
+           else:
+             multi_lines.append(line.strip())
+       elif len(multi_lines) > 0 and ncomm==0:
+          if ")" in line:
+            csub = str(line).split('{')
+            multi_lines.append(csub[0].strip())
+            nlines = ""
+            for c in multi_lines:
+              nlines += c
+            defines.append(nlines)
+            multi_lines = []
+          else:
+           multi_lines.append(line.strip())
+	
+ target = target[0]
+ f = open(str(target),'w')
+ with f:
+  f.write(('/* This file generated automatically. */\n'
+		   '/*          Do not modify.            */\n'
+		   '#include "udf.h"\n'
+		   '#include "prop.h"\n'
+		   '#include "dpm.h"\n'))
+  for d in defines:
+    f.write('extern {};\n'.format(d))
+  f.write('__declspec(dllexport) UDF_Data udf_data[] = {\n')
+  regex = re.compile('DEFINE_([^( ]*) *\( *([^, )]*)')
+  for d in defines:
+    define_name, first_arg = regex.match(d).groups()
+    f.write('{{"{0}", (void(*)()){0}, UDF_TYPE_{1}}},\n'.format(first_arg, define_name))
+  dllexport = '__declspec(dllexport) '
+  f.write(('}};\n'
+		  '{0}int n_udf_data = sizeof(udf_data)/sizeof(UDF_Data);\n'
+		  '#include "version.h"\n'
+		  '{0}void UDF_Inquire_Release(int *major, int *minor, int *revision)\n'
+		  '{{\n'
+		  '  *major = RampantReleaseMajor;\n'
+		  '  *minor = RampantReleaseMinor;\n'
+                  '  *revision = RampantReleaseRevision;\n'
+		  '}}\n').format(dllexport))
+
+
+ return 0
+
+udf_path = os.path.abspath('../../')
+src_path = os.path.join(udf_path,'src')
+
+c_sources_t = os.listdir(src_path)
+dir = os.path.abspath('.')
+
+dfile = os.path.join(dir,'resolve.exe')
+sfile = os.path.join(fluent_inc,'ntbin','win64','resolve.exe')
+Execute(Copy(dfile,sfile))
+
+c_sources = []
+for c in c_sources_t:
+  if sfiles:
+    if c in sfiles:
+      c_sources.append(c)
+  else:
+     c_sources.append(c)
+
+for c in c_sources_t:
+  if hfiles:
+    if c in hfiles:
+      c_sources.append(c)
+
+s=[]
+for c in c_sources:
+  if c.endswith('.c') or c.endswith('.cpp') or c.endswith('.h'):
+       sfile = os.path.join(src_path,c)
+       dfile = os.path.join(dir,c)
+       Execute(Copy(dfile,sfile))
+       if c.endswith('.c') or c.endswith('.cpp'):
+         s.append(dfile)
+t = ['udf_names.c']
+generate_udf_source(t,s,env)
+c_sources.append('udf_names.c')
+
+cpp_path = [
+os.path.join(fluent_path,release,arch,version),
+os.path.join(fluent_path,release,'src', 'main'),
+os.path.join(fluent_path,release,'src', 'addon-wrapper'),
+os.path.join(fluent_path,release,'src', 'io'),
+os.path.join(fluent_path,release,'src', 'species'),
+os.path.join(fluent_path,release,'src', 'pbns'),
+os.path.join(fluent_path,release,'src', 'numerics'),
+os.path.join(fluent_path,release,'src', 'sphysics'),
+os.path.join(fluent_path,release,'src', 'storage'),
+os.path.join(fluent_path,release,'src', 'mphase'),
+os.path.join(fluent_path,release,'src', 'bc'),
+os.path.join(fluent_path,release,'src', 'models'),
+os.path.join(fluent_path,release,'src', 'material'),
+os.path.join(fluent_path,release,'src', 'amg'),
+os.path.join(fluent_path,release,'src', 'util'),
+os.path.join(fluent_path,release,'src', 'mesh'),
+os.path.join(fluent_path,release,'src', 'udf'),
+os.path.join(fluent_path,release,'src', 'ht'),
+os.path.join(fluent_path,release,'src', 'dx'),
+os.path.join(fluent_path,release,'src', 'turbulence'),
+os.path.join(fluent_path,release,'src', 'acoustics'),
+os.path.join(fluent_path,release,'src', 'parallel'),
+os.path.join(fluent_path,release,'src', 'etc'),
+os.path.join(fluent_path,release,'src', 'ue'),
+os.path.join(fluent_path,release,'src', 'dpm'),
+os.path.join(fluent_path,release,'src', 'dbns'),
+os.path.join(fluent_path,release,'cortex', 'src'),
+os.path.join(fluent_path,release,'client', 'src'),
+os.path.join(fluent_path,release,'tgrid', 'src'),
+os.path.join(fluent_path,release,'PRIME','tgrid','src'),
+os.path.join(fluent_path,release,'multiport', 'src'),
+os.path.join(fluent_path,release,'multiport','mpi_wrapper','src'),
+os.path.join(fluent_path,'include'),
+os.path.abspath('.')
+]
+if env['CLANGV'] == 'builtin':
+  cpp_path += [os.path.join(fluent_path,'ntbin','clang','MSVC','14.10.25017','include'),
+               os.path.join(fluent_path,'ntbin','clang','x64','lib','clang','10.0.0','include'),
+			   os.path.join(fluent_path,'ntbin','clang','10','Include','10.0.18362.0','shared'),
+			   os.path.join(fluent_path,'ntbin','clang','10','Include','10.0.18362.0','ucrt'),
+			   os.path.join(fluent_path,'ntbin','clang','10','Include','10.0.18362.0','um')]
+
+inc_file = []
+for c in cpp_path:
+  inc_file.append(['-I',c])
+
+rld = Builder(action = 'resolve.exe -udf $SOURCES -head_file ud_io1.h')
+env.Append(BUILDERS = {'Foo_resolve' : rld})
+
+bld = Builder(action = '$CC $CFLAGS $EXTRAFLAGS $DINCPREFIX $SOURCE')
+env.Append(BUILDERS = {'Foo' : bld})
+
+bld = Builder(action = '$CC $CFLAGS $DINCPREFIX $SOURCE')
+env.Append(BUILDERS = {'Foo_cpp' : bld})
+
+cld = Builder(action = '$CLINK $DFLAGS /dll /out:$TARGET $SOURCES')
+env.Append(BUILDERS = {'Foo_lib' : cld})
+
+v = version
+
+if v=='2d_host' or v=='3d_host' or v=='2ddp_host' or v=='3ddp_host':
+   vpath = os.path.join(fluent_path,release,arch,v)
+   mpath = os.path.join(fluent_path,release,'multiport',arch,'net','shared')
+   LIBS=[]
+   LIBS.append(vpath+'\\'+'fl'+fstring+'.lib')
+   LIBS.append(mpath+'\\'+'mport.lib')
+   if env['CLANGV'] == 'builtin':
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libcmt.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libcpmt.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libvcruntime.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','oldnames.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','uuid.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','onecore.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libucrt.lib'))
+   env['DFLAGS'] = LIBS
+   cflags = ['/c','/DUDF_EXPORTING','/DUDF_NT','/DWIN64','/EHa','/wd4224']
+   cflags += ['-Wno-return-type','-Wno-implicit-function-declaration','-Wno-comment','-Wno-incompatible-library-redeclaration','-Wno-reserved-user-defined-literal']
+   env['CFLAGS'] = cflags
+   env['CFLAGS'].append(env['HOST_FLAGS'])
+elif v == '2d_node' or v=='3d_node' or v=='2ddp_node' or v=='3ddp_node':
+   vpath = os.path.join(fluent_path,release,arch,v)
+   mpath = os.path.join(fluent_path,release,'multiport',arch,'mpi','shared')
+   LIBS=[]
+   LIBS.append(vpath+'\\'+'fl_mpi'+fstring+'.lib')
+   LIBS.append(mpath+'\\'+'mport.lib')
+   if env['CLANGV'] == 'builtin':
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libcmt.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libcpmt.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libvcruntime.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','oldnames.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','onecore.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','libucrt.lib'))
+      LIBS.append(os.path.join(fluent_path,'ntbin','clang','lib','uuid.lib'))
+   env['DFLAGS'] = LIBS
+   cflags = ['/c','/DUDF_EXPORTING','/DUDF_NT','/DWIN64','/EHa','/wd4224']
+   cflags += ['-Wno-return-type','-Wno-implicit-function-declaration','-Wno-comment','-Wno-incompatible-library-redeclaration','-Wno-reserved-user-defined-literal']
+   env['CFLAGS'] = cflags
+c_sources_ = []
+for c in c_sources:
+  if c.endswith('.c') or c.endswith('.cpp'):
+           if c != 'udf_names.c':
+              c_sources_.append(c)
+
+print ("c_sources ",c_sources)
+print ("c_sources_ ",c_sources_)
+env['EXTRAFLAGS'] = ['/clang:-std=c99']
+
+c_objects = []
+
+for c in c_sources:
+  if c.endswith('.c'):
+    s = c
+    c_sub = str(c).split('.c')
+    t = c_sub[0]+'.obj'
+    env['DINCPREFIX'] = inc_file
+    env.Depends(env.Foo(t,s),env.Foo_resolve(c_sources_))
+    c_objects.append(t)
+
+for c in c_sources:
+   if c.endswith('.cpp'):
+     s = c
+     c_sub = str(c).split('.c')
+     t = c_sub[0]+'.obj'
+     env['DINCPREFIX'] = inc_file
+     env.Foo_cpp(t,s)
+     c_objects.append(t)
+
+env.Foo_lib('libudf.dll',c_objects)
